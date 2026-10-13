@@ -13,11 +13,14 @@ in time, the seat is released for others. The engine is safe under high concurre
 **Prerequisites:** Java 17+ and Maven 3.8+
 
 ```bash
-# run all tests (unit + stress)
+# Run all automated tests (unit + stress + model-based)
 mvn test
 
-# compile only
-mvn compile
+# Run manual interactive CLI test console
+mvn compile exec:java
+
+# Or run the automated walkthrough demo
+java -cp target/classes com.seathold.engine.DemoRunner --demo
 ```
 
 Expected output: `BUILD SUCCESS` with all tests passing.
@@ -37,7 +40,8 @@ seat-hold-engine/
     │   ├── Hold.java                  ← hold domain object
     │   ├── SeatStatus.java            ← sealed status type (Free/Held/Sold)
     │   ├── Result.java                ← typed Ok/Err return value
-    │   └── FakeClock.java             ← injectable clock for tests
+    │   ├── FakeClock.java             ← injectable clock for tests
+    │   └── DemoRunner.java            ← interactive manual test console
     └── test/java/com/seathold/engine/
         ├── SeatHoldEngineTest.java    ← unit tests (all 6 rules + edge cases)
         ├── ConcurrencyStressTest.java ← multi-threaded invariant + model test
