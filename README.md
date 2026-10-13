@@ -10,14 +10,15 @@ in time, the seat is released for others. The engine is safe under high concurre
 
 ## How to run
 
-**Prerequisites:** Java 17+ and Maven 3.8+
+**Prerequisites:** Java 17+ (Maven wrapper included, no manual Maven install required)
 
 ```bash
 # Run all automated tests (unit + stress + model-based)
-mvn test
+./mvnw test               # Linux / macOS / Git Bash
+.\mvnw.cmd test           # Windows PowerShell / CMD
 
 # Run manual interactive CLI test console
-mvn compile exec:java
+./mvnw compile exec:java
 
 # Or run the automated walkthrough demo
 java -cp target/classes com.seathold.engine.DemoRunner --demo
