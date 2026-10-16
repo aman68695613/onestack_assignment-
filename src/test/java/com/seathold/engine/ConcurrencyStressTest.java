@@ -1,224 +1,893 @@
 package com.seathold.engine;
 
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Concurrency stress tests.
- *
- * These tests hammer a small seat set with many threads running random
- * hold/confirm/release operations and a fake clock that advances
- * concurrently. After the run they assert the core invariants:
- *
- *   I1 — No seat is sold more than once.
- *   I2 — No user holds more than 4 seats at any snapshot.
- *   I3 — No confirmed-then-retaken hold is confirmed again (R3 safety).
- *
- * We print the random seed so any failing run can be reproduced exactly.
- */
 class ConcurrencyStressTest {
 
-    private static final int THREADS      = 16;
-    private static final int OPERATIONS   = 2_000;
-    private static final int SEAT_COUNT   = 5;   // deliberately small to maximise contention
-    private static final int USER_COUNT   = 4;
+    private static final int THREADS = 16;
+    private static final int SEAT_COUNT = 12;
+    private static final int USER_COUNT = 4;
+    private static final int EPISODES = 20;
+    private static final int OPERATIONS_PER_THREAD = 80;
     private static final long TTL_SECONDS = 3;
 
-    @RepeatedTest(3)
-    @DisplayName("stress: no invariant is violated under concurrent load")
-    void stressTest() throws InterruptedException {
-        long seed = System.nanoTime();
+    private record TrackedHold(
+            String holdId,
+            String seatId,
+            String userId
+    ) {}
+
+    private record HoldPair(
+            String engineId,
+            String referenceId
+    ) {}
+
+    @Test
+    @DisplayName("Stress: concurrent operations preserve observable invariants")
+    void stressTest() throws Exception {
+        long seed = Long.getLong("stress.seed", 424242L);
         System.out.println("[ConcurrencyStressTest] seed = " + seed);
 
-        FakeClock clock = new FakeClock(Instant.ofEpochSecond(0));
-        SeatHoldEngine engine = new SeatHoldEngineImpl(clock);
+        /*
+         * Fresh inventory in each episode prevents the test from becoming
+         * mostly rejection checks after every seat has been sold.
+         */
+        for (int episode = 0; episode < EPISODES; episode++) {
+            final int episodeId = episode;
 
-        // track sold seats externally to check I1
-        Set<String> soldSet      = Collections.newSetFromMap(new ConcurrentHashMap<>());
-        AtomicInteger doubleSale = new AtomicInteger(0);
+            FakeClock clock = new FakeClock(Instant.EPOCH);
+            SeatHoldEngine engine = new SeatHoldEngineImpl(clock);
 
-        List<String> seats = new ArrayList<>();
-        for (int i = 0; i < SEAT_COUNT; i++) seats.add("seat-" + i);
+            Map<String, TrackedHold> holds = new ConcurrentHashMap<>();
+            Map<String, TrackedHold> salesBySeat = new ConcurrentHashMap<>();
 
-        List<String> users = new ArrayList<>();
-        for (int i = 0; i < USER_COUNT; i++) users.add("user-" + i);
+            List<String> seats = createSeats(SEAT_COUNT);
+            List<Callable<Void>> actions = new ArrayList<>();
 
-        // Clock-advancing thread — moves time forward by 1s every ~10ms
-        Thread clockThread = Thread.ofVirtual().start(() -> {
-            try {
-                for (int i = 0; i < OPERATIONS / 10; i++) {
-                    Thread.sleep(10);
-                    clock.advanceSeconds(1);
-                }
-            } catch (InterruptedException ignored) {}
-        });
+            for (int thread = 0; thread < THREADS; thread++) {
+                final int threadId = thread;
 
-        CountDownLatch ready  = new CountDownLatch(THREADS);
-        CountDownLatch start  = new CountDownLatch(1);
-        CountDownLatch finish = new CountDownLatch(THREADS);
+                actions.add(() -> {
+                    Random random = new Random(
+                            seed ^ ((long) episodeId << 32) ^ threadId
+                    );
 
-        // Track active hold-ids per thread to confirm/release later
-        Map<String, String> holdTracker = new ConcurrentHashMap<>();
+                    for (int operation = 0;
+                         operation < OPERATIONS_PER_THREAD;
+                         operation++) {
 
-        ExecutorService pool = Executors.newFixedThreadPool(THREADS);
-        for (int t = 0; t < THREADS; t++) {
-            final int threadId = t;
-            pool.submit(() -> {
-                Random rng = new Random(seed ^ threadId);
-                ready.countDown();
-                try { start.await(); } catch (InterruptedException ignored) {}
+                        String seat = seats.get(
+                                random.nextInt(seats.size())
+                        );
 
-                for (int op = 0; op < OPERATIONS / THREADS; op++) {
-                    String seat = seats.get(rng.nextInt(seats.size()));
-                    String user = users.get(rng.nextInt(users.size()));
-                    int action  = rng.nextInt(4);
+                        String user = "user-" + random.nextInt(USER_COUNT);
 
-                    switch (action) {
-                        case 0, 1 -> { // hold (more likely)
-                            Result<String> r = engine.hold(seat, user, TTL_SECONDS);
-                            if (r.isOk()) {
-                                holdTracker.put(r.getValue(), user);
+                        switch (random.nextInt(7)) {
+                            case 0, 1 -> {
+                                Result<String> result = engine.hold(
+                                        seat,
+                                        user,
+                                        TTL_SECONDS
+                                );
+
+                                if (result.isOk()) {
+                                    rememberHold(
+                                            holds,
+                                            new TrackedHold(
+                                                    result.getValue(),
+                                                    seat,
+                                                    user
+                                            )
+                                    );
+                                }
                             }
-                        }
-                        case 2 -> { // confirm a random tracked hold
-                            pickRandom(holdTracker, rng).ifPresent(holdId -> {
-                                Result<String> r = engine.confirm(holdId);
-                                if (r.isOk()) {
-                                    // record the seat as sold; detect double-sale
-                                    SeatStatus st = engine.seatStatus(seat);
-                                    if (st instanceof SeatStatus.Sold sold) {
-                                        if (!soldSet.add(seat)) {
-                                            // seat was already in our sold set — should never happen
-                                            // (a different seat might be sold, not necessarily 'seat')
+
+                            case 2 -> {
+                                String secondSeat = seats.get(
+                                        random.nextInt(seats.size())
+                                );
+
+                                List<String> requested = List.of(
+                                        seat,
+                                        secondSeat
+                                );
+
+                                List<String> unique = new ArrayList<>(
+                                        new LinkedHashSet<>(requested)
+                                );
+
+                                Result<List<String>> result =
+                                        engine.holdMany(
+                                                user,
+                                                requested,
+                                                TTL_SECONDS
+                                        );
+
+                                if (result.isOk()) {
+                                    assertEquals(
+                                            unique.size(),
+                                            result.getValue().size(),
+                                            "Batch result must contain one ID per unique seat"
+                                    );
+
+                                    for (int i = 0; i < unique.size(); i++) {
+                                        rememberHold(
+                                                holds,
+                                                new TrackedHold(
+                                                        result.getValue().get(i),
+                                                        unique.get(i),
+                                                        user
+                                                )
+                                        );
+                                    }
+                                }
+                            }
+
+                            case 3 -> {
+                                TrackedHold hold = pickRandomHold(
+                                        holds,
+                                        random
+                                );
+
+                                if (hold != null) {
+                                    Result<String> result =
+                                            engine.confirm(hold.holdId());
+
+                                    if (result.isOk()) {
+                                        TrackedHold previous =
+                                                salesBySeat.putIfAbsent(
+                                                        hold.seatId(),
+                                                        hold
+                                                );
+
+                                        /*
+                                         * Reconfirming the SAME hold is legal.
+                                         * Selling through a DIFFERENT hold is not.
+                                         */
+                                        if (previous != null) {
+                                            assertEquals(
+                                                    previous,
+                                                    hold,
+                                                    "Different holds confirmed for seat "
+                                                            + hold.seatId()
+                                            );
                                         }
                                     }
                                 }
-                            });
-                        }
-                        case 3 -> { // release a random tracked hold
-                            pickRandom(holdTracker, rng).ifPresent(holdId -> {
-                                engine.release(holdId);
-                                holdTracker.remove(holdId);
-                            });
+                            }
+
+                            case 4 -> {
+                                TrackedHold hold = pickRandomHold(
+                                        holds,
+                                        random
+                                );
+
+                                if (hold != null) {
+                                    engine.release(hold.holdId());
+                                }
+                            }
+
+                            case 5 -> clock.advanceMillis(
+                                    1 + random.nextInt(1000)
+                            );
+
+                            case 6 -> assertNotNull(
+                                    engine.seatStatus(seat)
+                            );
+
+                            default -> throw new AssertionError(
+                                    "Unexpected action"
+                            );
                         }
                     }
+
+                    return null;
+                });
+            }
+
+            try {
+                runConcurrently(actions);
+
+                /*
+                 * All workers, including clock mutations, have finished.
+                 * These are quiescent checks, not inconsistent live scans.
+                 */
+                Map<String, Integer> activeByUser = new HashMap<>();
+
+                for (String seat : seats) {
+                    SeatStatus status = engine.seatStatus(seat);
+
+                    if (status instanceof SeatStatus.Held held) {
+                        assertNotNull(held.userId());
+
+                        assertFalse(
+                                clock.get().isAfter(held.expiresAt()),
+                                "Expired hold must not be reported as HELD"
+                        );
+
+                        activeByUser.merge(
+                                held.userId(),
+                                1,
+                                Integer::sum
+                        );
+                    }
+
+                    if (status instanceof SeatStatus.Sold sold) {
+                        TrackedHold recordedSale = salesBySeat.get(seat);
+
+                        assertNotNull(
+                                recordedSale,
+                                "SOLD seat has no successful confirmation: "
+                                        + seat
+                        );
+
+                        assertEquals(
+                                recordedSale.userId(),
+                                sold.userId(),
+                                "Sale owner differs from confirmed hold owner"
+                        );
+                    }
                 }
-                finish.countDown();
-            });
+
+                activeByUser.forEach((user, count) ->
+                        assertTrue(
+                                count <= 4,
+                                user + " has " + count + " active holds"
+                        )
+                );
+
+                for (TrackedHold sale : salesBySeat.values()) {
+                    assertEquals(
+                            new SeatStatus.Sold(sale.userId()),
+                            engine.seatStatus(sale.seatId())
+                    );
+
+                    for (TrackedHold other : holds.values()) {
+                        if (other.seatId().equals(sale.seatId())
+                                && !other.holdId().equals(sale.holdId())) {
+
+                            assertTrue(
+                                    engine.confirm(other.holdId()).isErr(),
+                                    "Another hold confirmed on a sold seat"
+                            );
+                        }
+                    }
+
+                    assertTrue(
+                            engine.release(sale.holdId()).isErr(),
+                            "Confirmed sale must not be releasable"
+                    );
+
+                    assertEquals(
+                            new SeatStatus.Sold(sale.userId()),
+                            engine.seatStatus(sale.seatId())
+                    );
+                }
+
+            } catch (Exception | AssertionError failure) {
+                throw new AssertionError(
+                        "Stress failure: seed=" + seed
+                                + ", episode=" + episodeId,
+                        failure
+                );
+            }
         }
-
-        ready.await();
-        start.countDown();
-        assertTrue(finish.await(30, TimeUnit.SECONDS), "stress test timed out");
-        clockThread.interrupt();
-        pool.shutdownNow();
-
-        // ---- Invariant checks ----
-
-        // I1: check every seat — each can be sold at most once
-        for (String s : seats) {
-            SeatStatus status = engine.seatStatus(s);
-            // If sold, the status must be Sold (not Held and Sold simultaneously)
-            // We cannot assert exactly one sale from outside, but we can verify
-            // the engine's own state is consistent: no seat reports Held AND is in soldSeats.
-            // The engine's internal map is our ground truth; the sealed type guarantees exclusivity.
-            assertFalse(status instanceof SeatStatus.Held held && held.userId() == null,
-                    "held status must have a non-null userId");
-        }
-
-        // I2: snapshot per-user hold count — must be ≤ 4
-        // We can only approximate this from outside; the engine enforces it internally.
-        // If the engine has a bug, the stress would have triggered confirm on a double-held
-        // seat and the result would be an error (which we count below).
-
-        assertEquals(0, doubleSale.get(), "double-sale counter must be 0 (seed=" + seed + ")");
     }
 
-    // ---- model-based / reference implementation test ----
+    @Test
+    @DisplayName("Concurrent same-user requests cannot exceed four holds")
+    void concurrentSameUserCannotExceedFourHolds() throws Exception {
+        for (int round = 0; round < 20; round++) {
+            FakeClock clock = new FakeClock(Instant.EPOCH);
+            SeatHoldEngine engine = new SeatHoldEngineImpl(clock);
+
+            List<Callable<Result<String>>> actions = new ArrayList<>();
+
+            for (int i = 0; i < 12; i++) {
+                String seat = "seat-" + i;
+
+                actions.add(() ->
+                        engine.hold(seat, "alice", 60)
+                );
+            }
+
+            List<Result<String>> results = runConcurrently(actions);
+
+            assertEquals(
+                    4L,
+                    results.stream().filter(Result::isOk).count(),
+                    "Exactly four requests should succeed"
+            );
+
+            long heldCount = 0;
+
+            for (int i = 0; i < 12; i++) {
+                SeatStatus status = engine.seatStatus("seat-" + i);
+
+                if (status instanceof SeatStatus.Held held) {
+                    assertEquals("alice", held.userId());
+                    heldCount++;
+                }
+            }
+
+            /*
+             * Time never advances and there are no releases.
+             * An oversubscription would remain visible here.
+             */
+            assertEquals(4L, heldCount);
+        }
+    }
 
     @Test
-    @DisplayName("model: engine matches single-threaded reference on random op sequence")
+    @DisplayName("Opposite-order overlapping batches do not deadlock")
+    void overlappingBatchesDoNotDeadlock() throws Exception {
+        for (int round = 0; round < 20; round++) {
+            FakeClock clock = new FakeClock(Instant.EPOCH);
+            SeatHoldEngine engine = new SeatHoldEngineImpl(clock);
+
+            List<Callable<Result<List<String>>>> actions = List.of(
+                    () -> engine.holdMany(
+                            "alice",
+                            List.of("A", "B"),
+                            60
+                    ),
+                    () -> engine.holdMany(
+                            "bob",
+                            List.of("B", "A"),
+                            60
+                    )
+            );
+
+            List<Result<List<String>>> results =
+                    runConcurrently(actions);
+
+            assertEquals(
+                    1L,
+                    results.stream().filter(Result::isOk).count(),
+                    "Only one conflicting batch may succeed"
+            );
+
+            String winner = results.get(0).isOk()
+                    ? "alice"
+                    : "bob";
+
+            SeatStatus.Held a = assertInstanceOf(
+                    SeatStatus.Held.class,
+                    engine.seatStatus("A")
+            );
+
+            SeatStatus.Held b = assertInstanceOf(
+                    SeatStatus.Held.class,
+                    engine.seatStatus("B")
+            );
+
+            assertEquals(winner, a.userId());
+            assertEquals(winner, b.userId());
+        }
+    }
+
+    @Test
+    @DisplayName("Expired confirmation versus takeover has exactly one winner")
+    void expiredConfirmVersusTakeover() throws Exception {
+        for (int round = 0; round < 40; round++) {
+            FakeClock clock = new FakeClock(Instant.EPOCH);
+            SeatHoldEngine engine = new SeatHoldEngineImpl(clock);
+
+            Result<String> initial = engine.hold("A", "alice", 1);
+            assertTrue(initial.isOk());
+
+            clock.advanceSeconds(2);
+
+            List<Callable<Result<String>>> actions = List.of(
+                    () -> engine.confirm(initial.getValue()),
+                    () -> engine.hold("A", "bob", 60)
+            );
+
+            List<Result<String>> results =
+                    runConcurrently(actions);
+
+            boolean aliceConfirmed = results.get(0).isOk();
+            boolean bobAcquired = results.get(1).isOk();
+
+            assertNotEquals(
+                    aliceConfirmed,
+                    bobAcquired,
+                    "Exactly one operation must succeed"
+            );
+
+            if (aliceConfirmed) {
+                assertEquals(
+                        new SeatStatus.Sold("alice"),
+                        engine.seatStatus("A")
+                );
+            } else {
+                SeatStatus.Held held = assertInstanceOf(
+                        SeatStatus.Held.class,
+                        engine.seatStatus("A")
+                );
+
+                assertEquals("bob", held.userId());
+                assertTrue(engine.confirm(initial.getValue()).isErr());
+                assertTrue(
+                        engine.confirm(results.get(1).getValue()).isOk()
+                );
+
+                assertEquals(
+                        new SeatStatus.Sold("bob"),
+                        engine.seatStatus("A")
+                );
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Concurrent confirm and release have one terminal winner")
+    void confirmVersusRelease() throws Exception {
+        for (int round = 0; round < 30; round++) {
+            FakeClock clock = new FakeClock(Instant.EPOCH);
+            SeatHoldEngine engine = new SeatHoldEngineImpl(clock);
+
+            Result<String> initial = engine.hold("A", "alice", 60);
+            assertTrue(initial.isOk());
+
+            List<Callable<Result<String>>> actions = List.of(
+                    () -> engine.confirm(initial.getValue()),
+                    () -> engine.release(initial.getValue())
+            );
+
+            List<Result<String>> results =
+                    runConcurrently(actions);
+
+            assertNotEquals(
+                    results.get(0).isOk(),
+                    results.get(1).isOk(),
+                    "Confirm and release cannot both win"
+            );
+
+            if (results.get(0).isOk()) {
+                assertEquals(
+                        new SeatStatus.Sold("alice"),
+                        engine.seatStatus("A")
+                );
+            } else {
+                assertInstanceOf(
+                        SeatStatus.Free.class,
+                        engine.seatStatus("A")
+                );
+
+                assertTrue(
+                        engine.confirm(initial.getValue()).isErr()
+                );
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Model: random operations match the independent reference")
     void modelBasedTest() {
-        long seed = System.nanoTime();
+        long seed = Long.getLong("model.seed", 20261016L);
         System.out.println("[ModelBasedTest] seed = " + seed);
-        Random rng = new Random(seed);
 
-        FakeClock clock = new FakeClock(Instant.ofEpochSecond(0));
-        SeatHoldEngine engine = new SeatHoldEngineImpl(clock);
-        ReferenceEngine reference = new ReferenceEngine(clock);
+        Random random = new Random(seed);
+        List<String> seats = createSeats(SEAT_COUNT);
+        List<String> users = List.of("alice", "bob", "charlie");
 
-        List<String> seats = List.of("s0", "s1", "s2");
-        List<String> users = List.of("u0", "u1");
-        record HoldPair(String engId, String refId) {}
-        List<HoldPair> holdPairs = new ArrayList<>();
+        for (int episode = 0; episode < 60; episode++) {
+            FakeClock clock = new FakeClock(Instant.EPOCH);
 
-        for (int i = 0; i < 500; i++) {
-            if (rng.nextInt(10) == 0) clock.advanceSeconds(rng.nextInt(5) + 1);
+            SeatHoldEngine engine = new SeatHoldEngineImpl(clock);
+            ReferenceEngine reference = new ReferenceEngine(clock);
 
-            int op = rng.nextInt(4);
-            String seat = seats.get(rng.nextInt(seats.size()));
-            String user = users.get(rng.nextInt(users.size()));
+            List<HoldPair> pairs = new ArrayList<>();
 
-            switch (op) {
-                case 0 -> {
-                    Result<String> eng = engine.hold(seat, user, 5);
-                    Result<String> ref = reference.hold(seat, user, 5);
-                    assertEquals(eng.isOk(), ref.isOk(),
-                            "hold(" + seat + "," + user + ") diverged at step " + i + " (seed=" + seed + ")");
-                    if (eng.isOk() && ref.isOk()) {
-                        holdPairs.add(new HoldPair(eng.getValue(), ref.getValue()));
+            Map<String, String> engineToReference = new HashMap<>();
+            Map<String, String> referenceToEngine = new HashMap<>();
+
+            Deque<String> trace = new ArrayDeque<>();
+
+            for (int step = 0; step < 160; step++) {
+                String seat = seats.get(
+                        random.nextInt(seats.size())
+                );
+
+                String user = users.get(
+                        random.nextInt(users.size())
+                );
+
+                long ttl = 1 + random.nextInt(8);
+                int operation = random.nextInt(7);
+
+                String context = "seed=" + seed
+                        + ", episode=" + episode
+                        + ", step=" + step;
+
+                try {
+                    switch (operation) {
+                        case 0, 1 -> {
+                            trace.addLast(
+                                    "hold(" + seat + "," + user + "," + ttl + ")"
+                            );
+
+                            Result<String> actual =
+                                    engine.hold(seat, user, ttl);
+
+                            Result<String> expected =
+                                    reference.hold(seat, user, ttl);
+
+                            assertEquals(
+                                    expected.isOk(),
+                                    actual.isOk(),
+                                    context + ": hold outcome"
+                            );
+
+                            if (actual.isOk()) {
+                                bindIds(
+                                        actual.getValue(),
+                                        expected.getValue(),
+                                        engineToReference,
+                                        referenceToEngine,
+                                        pairs,
+                                        context
+                                );
+                            }
+                        }
+
+                        case 2 -> {
+                            List<String> batch = new ArrayList<>();
+                            int size = random.nextInt(7);
+
+                            for (int i = 0; i < size; i++) {
+                                batch.add(
+                                        seats.get(
+                                                random.nextInt(seats.size())
+                                        )
+                                );
+                            }
+
+                            trace.addLast(
+                                    "holdMany(" + user + "," + batch
+                                            + "," + ttl + ")"
+                            );
+
+                            Result<List<String>> actual =
+                                    engine.holdMany(user, batch, ttl);
+
+                            Result<List<String>> expected =
+                                    reference.holdMany(user, batch, ttl);
+
+                            assertEquals(
+                                    expected.isOk(),
+                                    actual.isOk(),
+                                    context + ": batch outcome"
+                            );
+
+                            if (actual.isOk()) {
+                                assertEquals(
+                                        expected.getValue().size(),
+                                        actual.getValue().size(),
+                                        context + ": batch result size"
+                                );
+
+                                for (int i = 0;
+                                     i < actual.getValue().size();
+                                     i++) {
+
+                                    bindIds(
+                                            actual.getValue().get(i),
+                                            expected.getValue().get(i),
+                                            engineToReference,
+                                            referenceToEngine,
+                                            pairs,
+                                            context
+                                    );
+                                }
+                            }
+                        }
+
+                        case 3, 4 -> {
+                            HoldPair pair;
+
+                            if (pairs.isEmpty()
+                                    || random.nextInt(8) == 0) {
+
+                                pair = new HoldPair(
+                                        "unknown",
+                                        "unknown"
+                                );
+                            } else {
+                                pair = pairs.get(
+                                        random.nextInt(pairs.size())
+                                );
+                            }
+
+                            trace.addLast(
+                                    (operation == 3
+                                            ? "confirm("
+                                            : "release(")
+                                            + pair + ")"
+                            );
+
+                            Result<String> actual;
+                            Result<String> expected;
+
+                            if (operation == 3) {
+                                actual = engine.confirm(
+                                        pair.engineId()
+                                );
+
+                                expected = reference.confirm(
+                                        pair.referenceId()
+                                );
+                            } else {
+                                actual = engine.release(
+                                        pair.engineId()
+                                );
+
+                                expected = reference.release(
+                                        pair.referenceId()
+                                );
+                            }
+
+                            assertEquals(
+                                    expected.isOk(),
+                                    actual.isOk(),
+                                    context + ": confirm/release outcome"
+                            );
+
+                            if (actual.isOk()) {
+                                assertEquals(
+                                        expected.getValue(),
+                                        actual.getValue(),
+                                        context
+                                );
+                            }
+                        }
+
+                        case 5 -> {
+                            int millis = random.nextInt(4001);
+                            trace.addLast(
+                                    "advanceMillis(" + millis + ")"
+                            );
+                            clock.advanceMillis(millis);
+                        }
+
+                        case 6 -> trace.addLast(
+                                "seatStatus(" + seat + ")"
+                        );
+
+                        default -> throw new AssertionError(
+                                "Unexpected operation"
+                        );
                     }
-                }
-                case 1 -> {
-                    if (!holdPairs.isEmpty()) {
-                        HoldPair pair = holdPairs.get(rng.nextInt(holdPairs.size()));
-                        Result<String> eng = engine.confirm(pair.engId());
-                        Result<String> ref = reference.confirm(pair.refId());
-                        assertEquals(eng.isOk(), ref.isOk(),
-                                "confirm diverged at step " + i + " (seed=" + seed + ")");
+
+                    /*
+                     * Record equality checks state, user and expiry.
+                     * Compare every seat after every operation.
+                     */
+                    for (String candidate : seats) {
+                        assertEquals(
+                                reference.seatStatus(candidate),
+                                engine.seatStatus(candidate),
+                                context + ": status of " + candidate
+                        );
                     }
-                }
-                case 2 -> {
-                    if (!holdPairs.isEmpty()) {
-                        HoldPair pair = holdPairs.get(rng.nextInt(holdPairs.size()));
-                        Result<String> eng = engine.release(pair.engId());
-                        Result<String> ref = reference.release(pair.refId());
-                        assertEquals(eng.isOk(), ref.isOk(),
-                                "release diverged at step " + i + " (seed=" + seed + ")");
+
+                    for (String candidateUser : users) {
+                        long count = seats.stream()
+                                .map(engine::seatStatus)
+                                .filter(status ->
+                                        status instanceof SeatStatus.Held held
+                                                && held.userId().equals(
+                                                        candidateUser
+                                                )
+                                )
+                                .count();
+
+                        assertTrue(
+                                count <= 4,
+                                context + ": " + candidateUser
+                                        + " has " + count + " active holds"
+                        );
                     }
-                }
-                case 3 -> {
-                    SeatStatus eng = engine.seatStatus(seat);
-                    SeatStatus ref = reference.seatStatus(seat);
-                    // Compare the type of status — implementation details may differ
-                    assertEquals(eng.getClass(), ref.getClass(),
-                            "seatStatus(" + seat + ") class diverged at step " + i + " (seed=" + seed + ")");
+
+                    while (trace.size() > 20) {
+                        trace.removeFirst();
+                    }
+
+                } catch (AssertionError | RuntimeException failure) {
+                    throw new AssertionError(
+                            context + "\nRecent operations: " + trace,
+                            failure
+                    );
                 }
             }
         }
     }
 
-    @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
-    private static java.util.Optional<String> pickRandom(Map<String, String> map, Random rng) {
-        List<String> keys = new ArrayList<>(map.keySet());
-        if (keys.isEmpty()) return java.util.Optional.empty();
-        return java.util.Optional.of(keys.get(rng.nextInt(keys.size())));
+    private static void bindIds(
+            String engineId,
+            String referenceId,
+            Map<String, String> engineToReference,
+            Map<String, String> referenceToEngine,
+            List<HoldPair> pairs,
+            String context
+    ) {
+        assertNotNull(engineId, context);
+        assertNotNull(referenceId, context);
+
+        String previousReference = engineToReference.putIfAbsent(
+                engineId,
+                referenceId
+        );
+
+        String previousEngine = referenceToEngine.putIfAbsent(
+                referenceId,
+                engineId
+        );
+
+        if (previousReference != null) {
+            assertEquals(
+                    previousReference,
+                    referenceId,
+                    context + ": engine reused an ID incorrectly"
+            );
+        }
+
+        if (previousEngine != null) {
+            assertEquals(
+                    previousEngine,
+                    engineId,
+                    context + ": idempotent retry changed the hold ID"
+            );
+        }
+
+        if (previousReference == null) {
+            pairs.add(new HoldPair(engineId, referenceId));
+        }
+    }
+
+    private static void rememberHold(
+            Map<String, TrackedHold> holds,
+            TrackedHold hold
+    ) {
+        assertNotNull(hold.holdId());
+
+        TrackedHold previous = holds.putIfAbsent(
+                hold.holdId(),
+                hold
+        );
+
+        if (previous != null) {
+            assertEquals(
+                    previous,
+                    hold,
+                    "A hold ID was reused for a different seat or user"
+            );
+        }
+    }
+
+    private static TrackedHold pickRandomHold(
+            Map<String, TrackedHold> holds,
+            Random random
+    ) {
+        List<TrackedHold> snapshot = new ArrayList<>(
+                holds.values()
+        );
+
+        if (snapshot.isEmpty()) {
+            return null;
+        }
+
+        return snapshot.get(
+                random.nextInt(snapshot.size())
+        );
+    }
+
+    private static List<String> createSeats(int count) {
+        List<String> seats = new ArrayList<>();
+
+        for (int i = 0; i < count; i++) {
+            seats.add("seat-" + i);
+        }
+
+        return seats;
+    }
+
+    /*
+     * Starts tasks together and collects EVERY Future.
+     * Worker exceptions therefore fail the calling test.
+     */
+    private static <T> List<T> runConcurrently(
+            List<Callable<T>> actions
+    ) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(
+                actions.size(),
+                task -> {
+                    Thread thread = new Thread(task);
+
+                    /*
+                     * A broken intrinsic-lock implementation may ignore
+                     * interruption. Daemon workers avoid hanging the JVM
+                     * after the test's timeout has already failed.
+                     */
+                    thread.setDaemon(true);
+                    return thread;
+                }
+        );
+
+        CountDownLatch ready = new CountDownLatch(actions.size());
+        CountDownLatch start = new CountDownLatch(1);
+
+        try {
+            List<Future<T>> futures = new ArrayList<>();
+
+            for (Callable<T> action : actions) {
+                futures.add(pool.submit(() -> {
+                    ready.countDown();
+
+                    if (!start.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError(
+                                "Timed out waiting for start signal"
+                        );
+                    }
+
+                    return action.call();
+                }));
+            }
+
+            assertTrue(
+                    ready.await(5, TimeUnit.SECONDS),
+                    "Workers did not become ready"
+            );
+
+            start.countDown();
+
+            long deadline = System.nanoTime()
+                    + TimeUnit.SECONDS.toNanos(20);
+
+            List<T> results = new ArrayList<>();
+
+            for (Future<T> future : futures) {
+                long remaining = deadline - System.nanoTime();
+
+                assertTrue(
+                        remaining > 0,
+                        "Concurrent operations timed out; possible deadlock"
+                );
+
+                results.add(
+                        future.get(
+                                remaining,
+                                TimeUnit.NANOSECONDS
+                        )
+                );
+            }
+
+            return results;
+
+        } finally {
+            start.countDown();
+            pool.shutdownNow();
+        }
     }
 }

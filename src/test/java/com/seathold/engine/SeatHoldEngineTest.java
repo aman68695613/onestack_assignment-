@@ -5,14 +5,11 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Unit tests covering all business rules and edge cases.
- * The clock is always fake so tests finish instantly.
- */
 class SeatHoldEngineTest {
 
     private FakeClock clock;
@@ -20,262 +17,899 @@ class SeatHoldEngineTest {
 
     @BeforeEach
     void setUp() {
-        clock  = new FakeClock(Instant.ofEpochSecond(1_000_000));
+        clock = new FakeClock(
+                Instant.ofEpochSecond(1_000_000)
+        );
+
         engine = new SeatHoldEngineImpl(clock);
     }
 
-    // ===== Basic happy path =====
+    // ===== Basic purchase lifecycle =====
 
     @Test
-    @DisplayName("hold → confirm — basic purchase flow works")
+    @DisplayName("Hold then confirm sells the seat to the correct user")
     void basicHoldAndConfirm() {
-        Result<String> r = engine.hold("A1", "alice", 60);
-        assertTrue(r.isOk(), "hold should succeed");
+        String holdId = holdSuccessfully("A1", "alice", 60);
 
-        Result<String> confirm = engine.confirm(r.getValue());
-        assertTrue(confirm.isOk(), "confirm should succeed");
-        assertEquals("ok", confirm.getValue());
+        assertHeldBy("A1", "alice");
 
-        assertTrue(engine.seatStatus("A1") instanceof SeatStatus.Sold);
+        Result<String> result = engine.confirm(holdId);
+
+        assertTrue(result.isOk(), () -> "Confirm failed: " + result);
+        assertEquals("ok", result.getValue());
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A1")
+        );
     }
 
     @Test
-    @DisplayName("hold → release — seat goes back to free")
+    @DisplayName("Hold then release makes the seat available to another user")
     void holdThenRelease() {
-        Result<String> r = engine.hold("B2", "bob", 60);
-        assertTrue(r.isOk());
+        String holdId = holdSuccessfully("A1", "alice", 60);
 
-        assertTrue(engine.seatStatus("B2") instanceof SeatStatus.Held);
+        assertHeldBy("A1", "alice");
+        assertTrue(engine.release(holdId).isOk());
+        assertFree("A1");
 
-        Result<String> rel = engine.release(r.getValue());
-        assertTrue(rel.isOk());
-        assertTrue(engine.seatStatus("B2") instanceof SeatStatus.Free);
+        holdSuccessfully("A1", "bob", 60);
+        assertHeldBy("A1", "bob");
     }
 
-    // ===== R1: at most one holder; sold only once =====
+    // ===== R1: exclusion and permanent sale =====
 
     @Test
-    @DisplayName("R1 — second user cannot hold an already-held seat")
+    @DisplayName("A second user cannot acquire an actively held seat")
     void secondUserCannotHoldHeldSeat() {
-        engine.hold("C3", "alice", 60);
-        Result<String> second = engine.hold("C3", "bob", 60);
-        assertTrue(second.isErr());
+        String original = holdSuccessfully("A1", "alice", 60);
+        SeatStatus originalStatus = engine.seatStatus("A1");
+
+        Result<String> rejected = engine.hold("A1", "bob", 60);
+
+        assertTrue(rejected.isErr());
+        assertEquals(originalStatus, engine.seatStatus("A1"));
+
+        assertEquals(
+                original,
+                holdSuccessfully("A1", "alice", 60)
+        );
     }
 
     @Test
-    @DisplayName("R1 — cannot hold a sold seat")
+    @DisplayName("Sold seats remain unavailable even after time advances")
     void cannotHoldSoldSeat() {
-        String holdId = engine.hold("D4", "alice", 60).getValue();
-        engine.confirm(holdId);
-        Result<String> late = engine.hold("D4", "bob", 60);
-        assertTrue(late.isErr());
+        String holdId = holdSuccessfully("A1", "alice", 60);
+
+        assertTrue(engine.confirm(holdId).isOk());
+
+        clock.advanceSeconds(10_000);
+
+        assertTrue(engine.hold("A1", "bob", 60).isErr());
+        assertTrue(engine.hold("A1", "alice", 60).isErr());
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A1")
+        );
     }
 
-    // ===== R2: user holds at most 4 seats =====
+    // ===== R2: quota and accounting =====
 
     @Test
-    @DisplayName("R2 — user is blocked after 4 holds")
+    @DisplayName("A user cannot acquire a fifth active seat")
     void userCappedAtFourHolds() {
+        holdFourSeats("alice", 60);
+
+        assertTrue(engine.hold("S5", "alice", 60).isErr());
+        assertFree("S5");
+
         for (int i = 1; i <= 4; i++) {
-            assertTrue(engine.hold("seat-" + i, "alice", 60).isOk());
+            assertHeldBy("S" + i, "alice");
         }
-        Result<String> fifth = engine.hold("seat-5", "alice", 60);
-        assertTrue(fifth.isErr(), "fifth hold must be rejected");
     }
 
     @Test
-    @DisplayName("R2 — releasing a hold frees up a slot")
+    @DisplayName("Different users have independent quotas")
+    void userQuotasAreIndependent() {
+        holdFourSeats("alice", 60);
+
+        for (int i = 1; i <= 4; i++) {
+            holdSuccessfully("B" + i, "bob", 60);
+        }
+
+        assertTrue(engine.hold("A5", "alice", 60).isErr());
+        assertTrue(engine.hold("B5", "bob", 60).isErr());
+    }
+
+    @Test
+    @DisplayName("Release frees exactly one quota slot")
     void releaseFreesSeatSlot() {
-        List<String> ids = new java.util.ArrayList<>();
-        for (int i = 1; i <= 4; i++) {
-            ids.add(engine.hold("seat-" + i, "alice", 60).getValue());
-        }
-        engine.release(ids.get(0)); // free up one slot
-        assertTrue(engine.hold("seat-5", "alice", 60).isOk());
+        List<String> ids = holdFourSeats("alice", 60);
+
+        assertTrue(engine.release(ids.get(0)).isOk());
+
+        holdSuccessfully("S5", "alice", 60);
+        assertTrue(engine.hold("S6", "alice", 60).isErr());
     }
 
     @Test
-    @DisplayName("R2 — confirming a hold also frees up the slot")
+    @DisplayName("Confirmation frees exactly one quota slot")
     void confirmFreesSeatSlot() {
-        List<String> ids = new java.util.ArrayList<>();
-        for (int i = 1; i <= 4; i++) {
-            ids.add(engine.hold("seat-" + i, "alice", 60).getValue());
-        }
-        engine.confirm(ids.get(0));
-        assertTrue(engine.hold("seat-5", "alice", 60).isOk());
+        List<String> ids = holdFourSeats("alice", 60);
+
+        assertTrue(engine.confirm(ids.get(0)).isOk());
+
+        holdSuccessfully("S5", "alice", 60);
+        assertTrue(engine.hold("S6", "alice", 60).isErr());
     }
 
-    // ===== R3: expired hold confirmable if nobody else took seat =====
+    @Test
+    @DisplayName("Repeated release does not decrement quota twice")
+    void repeatedReleaseDoesNotCorruptQuota() {
+        List<String> ids = holdFourSeats("alice", 60);
+
+        assertTrue(engine.release(ids.get(0)).isOk());
+        assertTrue(engine.release(ids.get(0)).isOk());
+
+        holdSuccessfully("S5", "alice", 60);
+
+        assertTrue(
+                engine.hold("S6", "alice", 60).isErr(),
+                "Repeated release must not create an extra quota slot"
+        );
+    }
 
     @Test
-    @DisplayName("R3 — expired hold can still be confirmed when seat is still free")
+    @DisplayName("Repeated confirmation does not decrement quota twice")
+    void repeatedConfirmDoesNotCorruptQuota() {
+        List<String> ids = holdFourSeats("alice", 60);
+
+        assertTrue(engine.confirm(ids.get(0)).isOk());
+        assertTrue(engine.confirm(ids.get(0)).isOk());
+
+        holdSuccessfully("S5", "alice", 60);
+
+        assertTrue(
+                engine.hold("S6", "alice", 60).isErr(),
+                "Repeated confirmation must not create an extra quota slot"
+        );
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("S1")
+        );
+    }
+
+    @Test
+    @DisplayName("Expired holds do not block a new single-seat acquisition")
+    void expiredHoldsDoNotBlockNewSingleHold() {
+        holdFourSeats("alice", 1);
+        clock.advanceSeconds(2);
+
+        holdSuccessfully("S5", "alice", 60);
+        assertHeldBy("S5", "alice");
+    }
+
+    // ===== R3: expiry and late confirmation =====
+
+    @Test
+    @DisplayName("An unretaken expired hold remains confirmable")
     void expiredHoldCanBeConfirmed() {
-        String holdId = engine.hold("E5", "alice", 30).getValue();
+        String holdId = holdSuccessfully("A1", "alice", 30);
 
-        // Move time past the TTL
-        clock.advanceSeconds(60);
+        clock.advanceSeconds(31);
 
-        // Seat should appear free now (lazy expiry in status check)
-        assertTrue(engine.seatStatus("E5") instanceof SeatStatus.Free);
+        assertFree("A1");
 
-        // But Alice can still confirm — nobody else took it
-        Result<String> conf = engine.confirm(holdId);
-        assertTrue(conf.isOk(), "should confirm even after TTL if seat not retaken: " + conf.getError());
-        assertTrue(engine.seatStatus("E5") instanceof SeatStatus.Sold);
+        Result<String> result = engine.confirm(holdId);
+
+        assertTrue(
+                result.isOk(),
+                () -> "Late confirmation failed: " + result
+        );
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A1")
+        );
     }
 
     @Test
-    @DisplayName("R3 — expired hold cannot be confirmed if another user grabbed the seat")
+    @DisplayName("Repeated status reads do not revoke late confirmation")
+    void statusReadsDoNotInvalidateExpiredHold() {
+        String holdId = holdSuccessfully("A1", "alice", 1);
+
+        clock.advanceSeconds(2);
+
+        for (int i = 0; i < 5; i++) {
+            assertFree("A1");
+        }
+
+        assertTrue(engine.confirm(holdId).isOk());
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A1")
+        );
+    }
+
+    @Test
+    @DisplayName("An expired hold cannot confirm after successful takeover")
     void expiredHoldBlockedWhenSeatRetaken() {
-        String aliceHold = engine.hold("F6", "alice", 30).getValue();
-        clock.advanceSeconds(60); // alice's hold expires
+        String aliceHold = holdSuccessfully("A1", "alice", 1);
 
-        // Bob grabs the now-free seat
-        engine.hold("F6", "bob", 60);
+        clock.advanceSeconds(2);
 
-        // Alice tries to confirm her old hold — should fail
-        Result<String> conf = engine.confirm(aliceHold);
-        assertTrue(conf.isErr(), "should fail because bob now holds it");
+        String bobHold = holdSuccessfully("A1", "bob", 60);
+
+        assertTrue(engine.confirm(aliceHold).isErr());
+        assertHeldBy("A1", "bob");
+
+        assertTrue(engine.confirm(bobHold).isOk());
+
+        assertEquals(
+                new SeatStatus.Sold("bob"),
+                engine.seatStatus("A1")
+        );
     }
 
-    // ===== R4: holds are never extended =====
+    @Test
+    @DisplayName("Replacement release does not revive the old hold")
+    void replacementReleaseDoesNotReviveOldHold() {
+        String aliceHold = holdSuccessfully("A1", "alice", 1);
+
+        clock.advanceSeconds(2);
+
+        String bobHold = holdSuccessfully("A1", "bob", 60);
+
+        assertTrue(engine.release(bobHold).isOk());
+        assertFree("A1");
+
+        assertTrue(
+                engine.confirm(aliceHold).isErr(),
+                "Successful takeover permanently invalidates the old ID"
+        );
+
+        assertFree("A1");
+    }
 
     @Test
-    @DisplayName("R4 — idempotent hold does not extend the TTL")
-    void idempotentHoldDoesNotExtendTtl() {
-        String h1 = engine.hold("G7", "alice", 30).getValue();
+    @DisplayName("Releasing an old hold cannot release its replacement")
+    void oldReleaseCannotRemoveReplacement() {
+        String aliceHold = holdSuccessfully("A1", "alice", 1);
 
-        // Advance time so we're close to expiry
+        clock.advanceSeconds(2);
+
+        String bobHold = holdSuccessfully("A1", "bob", 60);
+
+        assertTrue(engine.release(aliceHold).isOk());
+        assertHeldBy("A1", "bob");
+
+        assertTrue(engine.confirm(bobHold).isOk());
+
+        assertEquals(
+                new SeatStatus.Sold("bob"),
+                engine.seatStatus("A1")
+        );
+    }
+
+    @Test
+    @DisplayName("Explicit release permanently prevents late confirmation")
+    void releasedExpiredHoldCannotConfirm() {
+        String holdId = holdSuccessfully("A1", "alice", 1);
+
+        clock.advanceSeconds(2);
+
+        assertTrue(engine.release(holdId).isOk());
+        assertTrue(engine.confirm(holdId).isErr());
+        assertFree("A1");
+    }
+
+    @Test
+    @DisplayName("Quota cleanup must preserve unretaken late-confirm rights")
+    void quotaCleanupMustNotDestroyLateConfirmation() {
+        List<String> ids = holdFourSeats("alice", 1);
+
+        clock.advanceSeconds(2);
+
+        holdSuccessfully("S5", "alice", 60);
+
+        assertTrue(
+                engine.confirm(ids.get(0)).isOk(),
+                "S1 was neither explicitly released nor successfully retaken"
+        );
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("S1")
+        );
+
+        assertHeldBy("S5", "alice");
+    }
+
+    @Test
+    @DisplayName("A rejected takeover must not invalidate the old holder")
+    void rejectedTakeoverPreservesOldLateConfirmation() {
+        String aliceHold = holdSuccessfully("A1", "alice", 1);
+
+        for (int i = 1; i <= 4; i++) {
+            holdSuccessfully("B" + i, "bob", 60);
+        }
+
+        clock.advanceSeconds(2);
+
+        assertTrue(
+                engine.hold("A1", "bob", 60).isErr(),
+                "Bob already holds four active seats"
+        );
+
+        assertTrue(
+                engine.confirm(aliceHold).isOk(),
+                "Bob never successfully acquired A1"
+        );
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A1")
+        );
+    }
+
+    // ===== R4 and R5: immutable expiry and active retries =====
+
+    @Test
+    @DisplayName("An active retry preserves the original hold ID")
+    void idempotentRetryReturnsSameHoldId() {
+        String first = holdSuccessfully("A1", "alice", 60);
+        String second = holdSuccessfully("A1", "alice", 60);
+
+        assertEquals(first, second);
+    }
+
+    @Test
+    @DisplayName("An active retry preserves the original expiry")
+    void idempotentHoldDoesNotExtendTtl() {
+        String first = holdSuccessfully("A1", "alice", 30);
+
+        SeatStatus.Held original = assertHeldBy("A1", "alice");
+
         clock.advanceSeconds(20);
 
-        // Same user calls hold again with a longer TTL
-        String h2 = engine.hold("G7", "alice", 9999).getValue();
+        String retry = holdSuccessfully("A1", "alice", 9999);
 
-        // Must be the same hold-id (R5), and the original TTL still applies
-        assertEquals(h1, h2, "idempotent hold must return the same hold-id");
+        assertEquals(first, retry);
+        assertEquals(original, engine.seatStatus("A1"));
 
-        // Advance past the original 30s TTL
-        clock.advanceSeconds(15); // total 35s elapsed
+        clock.advanceSeconds(11);
 
-        // The hold should now be expired
-        assertTrue(engine.seatStatus("G7") instanceof SeatStatus.Free,
-                "seat should be free after original TTL, not the new 9999s one");
+        assertFree("A1");
     }
 
-    // ===== R5: idempotent retry for same user + same seat =====
-
     @Test
-    @DisplayName("R5 — same user calling hold on same seat returns the same hold-id")
-    void idempotentRetryReturnsSameHoldId() {
-        String h1 = engine.hold("H8", "alice", 60).getValue();
-        String h2 = engine.hold("H8", "alice", 60).getValue();
-        assertEquals(h1, h2);
+    @DisplayName("An idempotent retry succeeds at the four-seat quota")
+    void retryAtQuotaDoesNotConsumeAnotherSlot() {
+        List<String> ids = holdFourSeats("alice", 60);
+
+        SeatStatus original = engine.seatStatus("S1");
+
+        String retry = holdSuccessfully("S1", "alice", 999);
+
+        assertEquals(ids.get(0), retry);
+        assertEquals(original, engine.seatStatus("S1"));
+
+        assertTrue(engine.hold("S5", "alice", 60).isErr());
     }
 
-    // ===== R6: holdMany is all-or-nothing =====
+    @Test
+    @DisplayName("Same-user reacquisition after expiry creates a new hold")
+    void sameUserReacquiresExpiredSeatWithNewId() {
+        String old = holdSuccessfully("A1", "alice", 1);
+
+        clock.advanceSeconds(2);
+
+        String fresh = holdSuccessfully("A1", "alice", 60);
+
+        assertNotEquals(old, fresh);
+        assertTrue(engine.confirm(old).isErr());
+        assertTrue(engine.confirm(fresh).isOk());
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A1")
+        );
+    }
+
+    // ===== R6: successful batches =====
 
     @Test
-    @DisplayName("R6 — holdMany succeeds when all seats are available")
+    @DisplayName("A successful batch owns every requested seat")
     void holdManyAllAvailable() {
-        Result<List<String>> r = engine.holdMany("alice", List.of("M1", "M2", "M3"), 60);
-        assertTrue(r.isOk());
-        assertEquals(3, r.getValue().size());
+        List<String> seats = List.of("A", "B", "C");
+
+        Result<List<String>> result =
+                engine.holdMany("alice", seats, 60);
+
+        assertTrue(result.isOk(), () -> "Batch failed: " + result);
+        assertEquals(3, result.getValue().size());
+
+        for (int i = 0; i < seats.size(); i++) {
+            String seat = seats.get(i);
+
+            assertHeldBy(seat, "alice");
+
+            assertEquals(
+                    result.getValue().get(i),
+                    holdSuccessfully(seat, "alice", 60)
+            );
+        }
     }
 
     @Test
-    @DisplayName("R6 — holdMany rolls back when one seat is already held")
-    void holdManyRollbackOnConflict() {
-        engine.hold("N1", "bob", 60); // block one seat
+    @DisplayName("Duplicate batch inputs count once and preserve first order")
+    void holdManyDeduplicatesSeats() {
+        Result<List<String>> result = engine.holdMany(
+                "alice",
+                List.of("B", "A", "B"),
+                60
+        );
 
-        Result<List<String>> r = engine.holdMany("alice", List.of("N2", "N1", "N3"), 60);
-        assertTrue(r.isErr(), "should fail because N1 is taken");
+        assertTrue(result.isOk(), () -> "Batch failed: " + result);
+        assertEquals(2, result.getValue().size());
 
-        // N2 and N3 must have been rolled back
-        assertTrue(engine.seatStatus("N2") instanceof SeatStatus.Free);
-        assertTrue(engine.seatStatus("N3") instanceof SeatStatus.Free);
+        assertEquals(
+                holdSuccessfully("B", "alice", 60),
+                result.getValue().get(0)
+        );
+
+        assertEquals(
+                holdSuccessfully("A", "alice", 60),
+                result.getValue().get(1)
+        );
+
+        holdSuccessfully("C", "alice", 60);
+        holdSuccessfully("D", "alice", 60);
+
+        assertTrue(engine.hold("E", "alice", 60).isErr());
     }
 
     @Test
-    @DisplayName("R6 — holdMany respects the per-user limit (R2)")
-    void holdManyRespectsUserLimit() {
-        engine.hold("P1", "alice", 60);
-        engine.hold("P2", "alice", 60);
-        engine.hold("P3", "alice", 60);
-        // Alice now holds 3. Requesting 2 more would exceed limit of 4.
-        Result<List<String>> r = engine.holdMany("alice", List.of("P4", "P5"), 60);
-        assertTrue(r.isErr(), "batch exceeds per-user limit");
-    }
-
-    @Test
-    @DisplayName("R6 — holdMany counts idempotent re-holds correctly (R2+R5)")
+    @DisplayName("Batch counts existing active holds as zero net additions")
     void holdManyIdempotentSeatCountedOnce() {
-        // Alice holds 3 seats already
-        engine.hold("Q1", "alice", 60);
-        engine.hold("Q2", "alice", 60);
-        engine.hold("Q3", "alice", 60);
-        // holdMany with Q1 (already hers) + one new seat = net +1 → total 4, fine
-        Result<List<String>> r = engine.holdMany("alice", List.of("Q1", "Q4"), 60);
-        assertTrue(r.isOk(), "should succeed because Q1 is already Alice's: " + (r.isErr() ? r.getError() : ""));
+        String original = holdSuccessfully("A", "alice", 60);
+
+        holdSuccessfully("B", "alice", 60);
+        holdSuccessfully("C", "alice", 60);
+
+        SeatStatus originalStatus = engine.seatStatus("A");
+
+        Result<List<String>> result = engine.holdMany(
+                "alice",
+                List.of("A", "D"),
+                999
+        );
+
+        assertTrue(result.isOk(), () -> "Batch failed: " + result);
+        assertEquals(original, result.getValue().get(0));
+        assertEquals(originalStatus, engine.seatStatus("A"));
+        assertHeldBy("D", "alice");
+
+        assertTrue(engine.hold("E", "alice", 60).isErr());
     }
 
-    // ===== Boundary / misc =====
+    @Test
+    @DisplayName("A batch of existing holds succeeds at the quota")
+    void holdManyExistingSeatsSucceedAtQuota() {
+        List<String> ids = holdFourSeats("alice", 60);
+
+        SeatStatus firstStatus = engine.seatStatus("S1");
+        SeatStatus secondStatus = engine.seatStatus("S2");
+
+        Result<List<String>> result = engine.holdMany(
+                "alice",
+                List.of("S1", "S2", "S1"),
+                999
+        );
+
+        assertTrue(result.isOk(), () -> "Batch failed: " + result);
+
+        assertEquals(
+                List.of(ids.get(0), ids.get(1)),
+                result.getValue()
+        );
+
+        assertEquals(firstStatus, engine.seatStatus("S1"));
+        assertEquals(secondStatus, engine.seatStatus("S2"));
+
+        assertTrue(engine.hold("S5", "alice", 60).isErr());
+    }
 
     @Test
-    @DisplayName("seatStatus returns Free for unknown seat")
+    @DisplayName("An empty batch succeeds without changing existing state")
+    void emptyBatchHasNoEffect() {
+        String original = holdSuccessfully("A", "alice", 60);
+        SeatStatus before = engine.seatStatus("A");
+
+        Result<List<String>> result =
+                engine.holdMany("alice", List.of(), 60);
+
+        assertTrue(result.isOk());
+        assertTrue(result.getValue().isEmpty());
+
+        assertEquals(before, engine.seatStatus("A"));
+        assertEquals(
+                original,
+                holdSuccessfully("A", "alice", 60)
+        );
+    }
+
+    // ===== R6: rejected batches and atomicity =====
+
+    @Test
+    @DisplayName("A conflicting batch releases only its newly created seats")
+    void holdManyRollbackOnConflict() {
+        String bobHold = holdSuccessfully("C", "bob", 60);
+
+        Result<List<String>> result = engine.holdMany(
+                "alice",
+                List.of("A", "B", "C"),
+                60
+        );
+
+        assertTrue(result.isErr());
+
+        assertFree("A");
+        assertFree("B");
+        assertHeldBy("C", "bob");
+
+        assertEquals(
+                bobHold,
+                holdSuccessfully("C", "bob", 60)
+        );
+    }
+
+    @Test
+    @DisplayName("Failed batch must preserve a pre-existing hold")
+    void failedBatchPreservesExistingHold() {
+        String aliceHold = holdSuccessfully("A", "alice", 60);
+        SeatStatus originalStatus = engine.seatStatus("A");
+
+        holdSuccessfully("C", "bob", 60);
+
+        Result<List<String>> result = engine.holdMany(
+                "alice",
+                List.of("A", "B", "C"),
+                999
+        );
+
+        assertTrue(result.isErr());
+
+        assertEquals(
+                originalStatus,
+                engine.seatStatus("A"),
+                "A existed before the failed batch"
+        );
+
+        assertFree("B");
+        assertHeldBy("C", "bob");
+
+        assertEquals(
+                aliceHold,
+                holdSuccessfully("A", "alice", 60)
+        );
+
+        assertTrue(engine.confirm(aliceHold).isOk());
+    }
+
+    @Test
+    @DisplayName("A failed batch does not leak quota")
+    void failedBatchDoesNotLeakQuota() {
+        holdSuccessfully("C", "bob", 60);
+
+        assertTrue(
+                engine.holdMany(
+                        "alice",
+                        List.of("A", "B", "C"),
+                        60
+                ).isErr()
+        );
+
+        for (String seat : List.of("D", "E", "F", "G")) {
+            holdSuccessfully(seat, "alice", 60);
+        }
+
+        assertTrue(engine.hold("H", "alice", 60).isErr());
+    }
+
+    @Test
+    @DisplayName("Over-quota batch leaves both requested seats free")
+    void holdManyRespectsUserLimit() {
+        holdSuccessfully("A", "alice", 60);
+        holdSuccessfully("B", "alice", 60);
+        holdSuccessfully("C", "alice", 60);
+
+        Result<List<String>> result = engine.holdMany(
+                "alice",
+                List.of("D", "E"),
+                60
+        );
+
+        assertTrue(result.isErr());
+
+        assertFree("D");
+        assertFree("E");
+
+        assertHeldBy("A", "alice");
+        assertHeldBy("B", "alice");
+        assertHeldBy("C", "alice");
+
+        holdSuccessfully("F", "alice", 60);
+        assertTrue(engine.hold("G", "alice", 60).isErr());
+    }
+
+    @Test
+    @DisplayName("A batch of more than four unique seats has no effect")
+    void oversizedBatchLeavesAllSeatsFree() {
+        List<String> seats = List.of("A", "B", "C", "D", "E");
+
+        Result<List<String>> result =
+                engine.holdMany("alice", seats, 60);
+
+        assertTrue(result.isErr());
+
+        for (String seat : seats) {
+            assertFree(seat);
+        }
+    }
+
+    @Test
+    @DisplayName("A sold-seat conflict leaves other requested seats free")
+    void holdManyFailsOnSoldSeat() {
+        String soldHold = holdSuccessfully("C", "bob", 60);
+
+        assertTrue(engine.confirm(soldHold).isOk());
+
+        Result<List<String>> result = engine.holdMany(
+                "alice",
+                List.of("A", "B", "C"),
+                60
+        );
+
+        assertTrue(result.isErr());
+
+        assertFree("A");
+        assertFree("B");
+
+        assertEquals(
+                new SeatStatus.Sold("bob"),
+                engine.seatStatus("C")
+        );
+    }
+
+    @Test
+    @DisplayName("Expired holds do not consume quota for a new batch")
+    void expiredHoldsDoNotBlockNewBatch() {
+        holdFourSeats("alice", 1);
+
+        clock.advanceSeconds(2);
+
+        Result<List<String>> result = engine.holdMany(
+                "alice",
+                List.of("A", "B"),
+                60
+        );
+
+        assertTrue(
+                result.isOk(),
+                () -> "Expired holds must not consume quota: " + result
+        );
+
+        assertHeldBy("A", "alice");
+        assertHeldBy("B", "alice");
+    }
+
+    @Test
+    @DisplayName("A failed batch preserves an expired prior entitlement")
+    void failedBatchPreservesExpiredLateConfirmation() {
+        String aliceHold = holdSuccessfully("A", "alice", 1);
+
+        holdSuccessfully("C", "charlie", 60);
+
+        clock.advanceSeconds(2);
+
+        Result<List<String>> result = engine.holdMany(
+                "bob",
+                List.of("A", "B", "C"),
+                60
+        );
+
+        assertTrue(result.isErr());
+
+        assertFree("B");
+        assertHeldBy("C", "charlie");
+
+        assertTrue(
+                engine.confirm(aliceHold).isOk(),
+                "A failed all-or-nothing batch must not revoke Alice's prior entitlement"
+        );
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A")
+        );
+    }
+
+    // ===== Boundaries and terminal-state behavior =====
+
+    @Test
+    @DisplayName("Unknown seat is free")
     void unknownSeatIsFree() {
-        assertTrue(engine.seatStatus("nonexistent") instanceof SeatStatus.Free);
+        assertFree("unknown-seat");
     }
 
     @Test
-    @DisplayName("confirm on unknown hold-id returns error")
+    @DisplayName("Unknown hold cannot be confirmed")
     void confirmUnknownHoldId() {
-        Result<String> r = engine.confirm("does-not-exist");
-        assertTrue(r.isErr());
+        assertTrue(engine.confirm("unknown-hold").isErr());
     }
 
     @Test
-    @DisplayName("release on unknown hold-id returns error")
+    @DisplayName("Unknown hold cannot be released")
     void releaseUnknownHoldId() {
-        Result<String> r = engine.release("does-not-exist");
-        assertTrue(r.isErr());
+        assertTrue(engine.release("unknown-hold").isErr());
     }
 
     @Test
-    @DisplayName("cannot release a confirmed hold")
+    @DisplayName("A confirmed hold cannot be released")
     void cannotReleaseConfirmedHold() {
-        String holdId = engine.hold("Z1", "alice", 60).getValue();
-        engine.confirm(holdId);
-        Result<String> r = engine.release(holdId);
-        assertTrue(r.isErr());
+        String holdId = holdSuccessfully("A", "alice", 60);
+
+        assertTrue(engine.confirm(holdId).isOk());
+        assertTrue(engine.release(holdId).isErr());
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A")
+        );
     }
 
     @Test
-    @DisplayName("confirm is idempotent for an already-confirmed hold")
+    @DisplayName("Confirmation is idempotent")
     void confirmIdempotent() {
-        String holdId = engine.hold("Z2", "alice", 60).getValue();
-        engine.confirm(holdId);
-        Result<String> second = engine.confirm(holdId);
-        assertTrue(second.isOk(), "second confirm on same hold should be ok");
+        String holdId = holdSuccessfully("A", "alice", 60);
+
+        assertTrue(engine.confirm(holdId).isOk());
+
+        Result<String> repeated = engine.confirm(holdId);
+
+        assertTrue(repeated.isOk());
+        assertEquals("ok", repeated.getValue());
+
+        assertEquals(
+                new SeatStatus.Sold("alice"),
+                engine.seatStatus("A")
+        );
     }
 
     @Test
-    @DisplayName("release is idempotent")
+    @DisplayName("Release is idempotent and prevents confirmation")
     void releaseIdempotent() {
-        String holdId = engine.hold("Z3", "alice", 60).getValue();
-        engine.release(holdId);
-        Result<String> second = engine.release(holdId);
-        assertTrue(second.isOk());
+        String holdId = holdSuccessfully("A", "alice", 60);
+
+        assertTrue(engine.release(holdId).isOk());
+        assertTrue(engine.release(holdId).isOk());
+        assertTrue(engine.confirm(holdId).isErr());
+
+        assertFree("A");
     }
 
     @Test
-    @DisplayName("Held status includes correct userId and expiry")
+    @DisplayName("Held status contains the correct owner and expiry")
     void heldStatusDetails() {
         Instant before = clock.get();
-        engine.hold("Z4", "alice", 120);
-        SeatStatus s = engine.seatStatus("Z4");
-        assertInstanceOf(SeatStatus.Held.class, s);
-        SeatStatus.Held held = (SeatStatus.Held) s;
-        assertEquals("alice", held.userId());
-        assertEquals(before.plusSeconds(120), held.expiresAt());
+
+        holdSuccessfully("A", "alice", 120);
+
+        assertEquals(
+                new SeatStatus.Held(
+                        "alice",
+                        before.plusSeconds(120)
+                ),
+                engine.seatStatus("A")
+        );
+    }
+
+    @Test
+    @DisplayName("Expiry boundary preserves the current strictly-after policy")
+    void exactExpiryBoundary() {
+        holdSuccessfully("A", "alice", 1);
+
+        clock.advanceMillis(999);
+        assertHeldBy("A", "alice");
+
+        clock.advanceMillis(1);
+
+        /*
+         * Current policy: now == expiresAt is still active.
+         * Change this test if the documented policy changes to >=.
+         */
+        assertHeldBy("A", "alice");
+        assertTrue(engine.hold("A", "bob", 60).isErr());
+
+        clock.advanceMillis(1);
+
+        assertFree("A");
+        holdSuccessfully("A", "bob", 60);
+        assertHeldBy("A", "bob");
+    }
+
+    // ===== Helpers =====
+
+    private String holdSuccessfully(
+            String seatId,
+            String userId,
+            long ttlSeconds
+    ) {
+        Result<String> result = engine.hold(
+                seatId,
+                userId,
+                ttlSeconds
+        );
+
+        assertTrue(
+                result.isOk(),
+                () -> "Expected successful hold for seat "
+                        + seatId + ", user " + userId
+                        + ", but got " + result
+        );
+
+        assertNotNull(result.getValue());
+
+        return result.getValue();
+    }
+
+    private List<String> holdFourSeats(
+            String userId,
+            long ttlSeconds
+    ) {
+        List<String> ids = new ArrayList<>();
+
+        for (int i = 1; i <= 4; i++) {
+            ids.add(
+                    holdSuccessfully(
+                            "S" + i,
+                            userId,
+                            ttlSeconds
+                    )
+            );
+        }
+
+        return ids;
+    }
+
+    private SeatStatus.Held assertHeldBy(
+            String seatId,
+            String userId
+    ) {
+        SeatStatus.Held held = assertInstanceOf(
+                SeatStatus.Held.class,
+                engine.seatStatus(seatId),
+                "Expected HELD status for " + seatId
+        );
+
+        assertEquals(
+                userId,
+                held.userId(),
+                "Incorrect owner for " + seatId
+        );
+
+        return held;
+    }
+
+    private void assertFree(String seatId) {
+        assertInstanceOf(
+                SeatStatus.Free.class,
+                engine.seatStatus(seatId),
+                "Expected FREE status for " + seatId
+        );
     }
 }
